@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>BingeCat Sync</title>
+</head>
+<body>
+<div id="BingeCatConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-select,emby-checkbox">
+    <div data-role="content">
+        <div class="content-primary">
+            <h1>BingeCat Sync</h1>
+            <p>Pair each Jellyfin user with the matching BingeCat profile. All sync traffic is outbound HTTPS; your Jellyfin server stays private.</p>
+            <div class="selectContainer">
+                <label class="selectLabel" for="BingeCatUser">Jellyfin user</label>
+                <select is="emby-select" id="BingeCatUser" class="emby-select-withcolor emby-select"></select>
+                <div class="fieldDescription">Pair users separately so watched history never crosses profiles.</div>
+            </div>
+            <button is="emby-button" type="button" id="BingeCatPair" class="raised button-submit block emby-button"><span>Pair selected user</span></button>
+            <div id="BingeCatPairing" style="display:none; margin-top:1.5em">
+                <h2>Complete pairing</h2>
+                <div id="BingeCatCode" style="font-size:2em; font-family:monospace; letter-spacing:.12em"></div>
+                <p><a id="BingeCatVerify" target="_blank" rel="noreferrer">Open BingeCat to approve this code</a></p>
+                <p id="BingeCatPairStatus">Waiting for approval…</p>
+            </div>
+            <h2 style="margin-top:2em">Paired users</h2>
+            <div id="BingeCatLinks"></div>
+            <label class="emby-checkbox-label" style="margin-top:1.5em">
+                <input id="BingeCatEnabled" type="checkbox" is="emby-checkbox" />
+                <span>Keep outbound sync service enabled</span>
+            </label>
+        </div>
+    </div>
+    <script type="text/javascript">
+        (function () {
+            const root = document.querySelector('#BingeCatConfigPage');
+            const endpoint = (path) => ApiClient.getUrl('Plugins/BingeCat/' + path);
+            let pollTimer = null;
+
+            async function json(path, method, body) {
+                const response = await ApiClient.fetch({
+                    url: endpoint(path), method: method || 'GET',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: body ? JSON.stringify(body) : undefined
+                });
+                if (!response.ok) throw new Error('Request failed (' + response.status + ')');
+                return response.status === 204 ? null : response.json();
+            }
+
+            async function refresh() {
+                const [users, status] = await Promise.all([json('Users'), json('Status')]);
+                const select = root.querySelector('#BingeCatUser');
+                const options = users.map((user) => {
+                    const option = document.createElement('option');
+                    option.value = String(user.id);
+                    option.textContent = String(user.name);
+                    return option;
+                });
+                select.replaceChildren(...options);
+                root.querySelector('#BingeCatEnabled').checked = status.serviceEnabled;
+                const links = root.querySelector('#BingeCatLinks');
+                links.replaceChildren();
+                if (!status.links.length) {
+                    const empty = document.createElement('p');
+                    empty.textContent = 'No Jellyfin users paired yet.';
+                    links.append(empty);
+                } else {
+                    status.links.forEach((link) => {
+                        const row = document.createElement('div');
+                        row.style.cssText = 'display:flex;justify-content:space-between;gap:1em;padding:.75em 0;border-bottom:1px solid currentColor';
+                        const summary = document.createElement('span');
+                        const name = document.createElement('strong');
+                        name.textContent = String(link.userName);
+                        const statusText = document.createElement('small');
+                        statusText.textContent = String(link.lastErrorCode || 'Connected');
+                        summary.append(name, document.createElement('br'), statusText);
+                        const button = document.createElement('button');
+                        button.setAttribute('is', 'emby-button');
+                        button.type = 'button';
+                        button.className = 'button-link emby-button bingeCatDisconnect';
+                        button.dataset.user = String(link.userId);
+                        button.textContent = 'Disconnect';
+                        button.addEventListener('click', async () => {
+                            await json('Disconnect', 'POST', { userId: button.dataset.user });
+                            await refresh();
+                        });
+                        row.append(summary, button);
+                        links.append(row);
+                    });
+                }
+            }
+
+            root.addEventListener('pageshow', async function () {
+                Dashboard.showLoadingMsg();
+                try { await refresh(); } finally { Dashboard.hideLoadingMsg(); }
+            });
+
+            root.querySelector('#BingeCatPair').addEventListener('click', async function () {
+                const userId = root.querySelector('#BingeCatUser').value;
+                Dashboard.showLoadingMsg();
+                try {
+                    const code = await json('ConnectStart', 'POST', { userId: userId });
+                    root.querySelector('#BingeCatCode').textContent = code.user_code;
+                    const verify = root.querySelector('#BingeCatVerify');
+                    verify.href = code.verification_uri_complete;
+                    root.querySelector('#BingeCatPairing').style.display = 'block';
+                    clearInterval(pollTimer);
+                    pollTimer = setInterval(async function () {
+                        const state = await json('Poll', 'POST', { userId: userId });
+                        root.querySelector('#BingeCatPairStatus').textContent = state.status === 'authorization_pending' ? 'Waiting for approval…' : state.status;
+                        if (state.status === 'connected' || state.status === 'device_code_expired') {
+                            clearInterval(pollTimer);
+                            if (state.status === 'connected') {
+                                root.querySelector('#BingeCatPairing').style.display = 'none';
+                                await refresh();
+                            }
+                        }
+                    }, Math.max(5, code.interval || 5) * 1000);
+                } finally { Dashboard.hideLoadingMsg(); }
+            });
+
+            root.querySelector('#BingeCatEnabled').addEventListener('change', async function (event) {
+                await json('Settings', 'POST', { serviceEnabled: event.target.checked });
+            });
+        }());
+    </script>
+</div>
+</body>
+</html>
