@@ -15,17 +15,24 @@ public sealed class BingeCatController : ControllerBase
 {
     private readonly IUserManager _userManager;
     private readonly PairingService _pairingService;
+    private readonly OutboxStore _outbox;
 
-    public BingeCatController(IUserManager userManager, PairingService pairingService)
+    public BingeCatController(IUserManager userManager, PairingService pairingService, OutboxStore outbox)
     {
         _userManager = userManager;
         _pairingService = pairingService;
+        _outbox = outbox;
     }
 
     [HttpGet("Users")]
     public ActionResult Users()
     {
-        return Ok(_userManager.Users
+#if NET10_0_OR_GREATER
+        var users = _userManager.GetUsers();
+#else
+        var users = _userManager.Users;
+#endif
+        return Ok(users
             .OrderBy(user => user.Username, StringComparer.OrdinalIgnoreCase)
             .Select(user => new { id = user.Id, name = user.Username }));
     }
@@ -131,16 +138,32 @@ public sealed class BingeCatController : ControllerBase
             // The server-side token naturally becomes unreachable once erased.
         }
 
-        lock (plugin.Configuration.ProfileLinksSyncRoot)
+        var gate = _outbox.UserGate(userId);
+        await gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
         {
-            var current = plugin.Configuration.FindLink(userId);
-            if (current is not null
-                && string.Equals(current.DeviceToken, link.DeviceToken, StringComparison.Ordinal))
+            var removed = false;
+            lock (plugin.Configuration.ProfileLinksSyncRoot)
             {
-                current.DeviceToken = string.Empty;
-                plugin.Configuration.ProfileLinks.Remove(current);
-                plugin.SaveConfiguration();
+                var current = plugin.Configuration.FindLink(userId);
+                if (current is not null
+                    && string.Equals(current.DeviceToken, link.DeviceToken, StringComparison.Ordinal))
+                {
+                    current.DeviceToken = string.Empty;
+                    plugin.Configuration.ProfileLinks.Remove(current);
+                    plugin.SaveConfiguration();
+                    removed = true;
+                }
             }
+
+            if (removed)
+            {
+                await _outbox.ClearUserAsync(userId, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            gate.Release();
         }
         _pairingService.Cancel(userId);
         return NoContent();

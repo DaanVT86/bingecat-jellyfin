@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json.Serialization;
 using Jellyfin.Plugin.BingeCat.Api;
 using Jellyfin.Plugin.BingeCat.Configuration;
 using MediaBrowser.Controller;
@@ -10,16 +11,19 @@ namespace Jellyfin.Plugin.BingeCat.Services;
 public sealed class PairingService
 {
     private readonly BingeCatClient _client;
+    private readonly OutboxStore _outbox;
     private readonly IServerApplicationHost _applicationHost;
     private readonly ILogger<PairingService> _logger;
     private readonly ConcurrentDictionary<Guid, PendingPairing> _pending = new();
 
     public PairingService(
         BingeCatClient client,
+        OutboxStore outbox,
         IServerApplicationHost applicationHost,
         ILogger<PairingService> logger)
     {
         _client = client;
+        _outbox = outbox;
         _applicationHost = applicationHost;
         _logger = logger;
     }
@@ -62,26 +66,45 @@ public sealed class PairingService
 
         var plugin = Plugin.Instance ?? throw new InvalidOperationException("BingeCat plugin is unavailable.");
         var configuration = plugin.Configuration;
-        lock (configuration.ProfileLinksSyncRoot)
+        // Events queued under a previous pairing must never reach the new profile: clear them and
+        // swap the token while holding the user's gate, which enqueue and delivery also take.
+        var gate = _outbox.UserGate(userId);
+        await gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
         {
-            var link = configuration.FindLink(userId);
-            if (link is null)
+            await _outbox.ClearUserAsync(userId, CancellationToken.None).ConfigureAwait(false);
+            lock (configuration.ProfileLinksSyncRoot)
             {
-                link = new ProfileLink { JellyfinUserId = userId.ToString("D") };
-                configuration.ProfileLinks.Add(link);
-            }
+                var link = configuration.FindLink(userId);
+                if (link is null)
+                {
+                    link = new ProfileLink { JellyfinUserId = userId.ToString("D") };
+                    configuration.ProfileLinks.Add(link);
+                }
 
-            link.JellyfinUserName = pending.UserName;
-            link.DeviceToken = response.AccessToken;
-            link.ConnectionId = response.ConnectionId;
-            link.LinkedAtUtc = DateTime.UtcNow;
-            link.LastErrorCode = string.Empty;
-            plugin.SaveConfiguration();
+                link.JellyfinUserName = pending.UserName;
+                link.DeviceToken = response.AccessToken;
+                link.ConnectionId = response.ConnectionId;
+                link.LinkedAtUtc = DateTime.UtcNow;
+                link.LastErrorCode = string.Empty;
+                link.AcknowledgedSyncGeneration = 0; // a new credential starts its generations again
+                plugin.SaveConfiguration();
+            }
+        }
+        finally
+        {
+            gate.Release();
         }
 
         _pending.TryRemove(userId, out _);
         _logger.LogInformation("Paired Jellyfin user {UserId} with BingeCat connection {ConnectionId}", userId, response.ConnectionId);
         return new PairingPollResult("connected", response.ConnectionId);
+    }
+
+    /// <summary>True while an unexpired device code for this user awaits approval; delivery pauses meanwhile.</summary>
+    public bool IsPairing(Guid userId)
+    {
+        return _pending.TryGetValue(userId, out var pending) && pending.ExpiresAtUtc > DateTime.UtcNow;
     }
 
     public void Cancel(Guid userId)
@@ -97,4 +120,6 @@ public sealed class PairingService
     private sealed record PendingPairing(string DeviceCode, string UserName, DateTime ExpiresAtUtc);
 }
 
-public sealed record PairingPollResult(string Status, string? ConnectionId);
+public sealed record PairingPollResult(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("connectionId")] string? ConnectionId);

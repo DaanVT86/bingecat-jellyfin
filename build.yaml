@@ -1,6 +1,6 @@
 name: "BingeCat Sync"
 guid: "832bd9b3-75aa-4dd7-8477-8d13de65f9ee"
-version: "0.1.0.0"
+version: "0.2.0.0"
 overview: "One-way watched-history sync from Jellyfin to BingeCat."
 description: |
   Pairs individual Jellyfin users with BingeCat profiles and sends watched
@@ -15,4 +15,4 @@ artifacts:
   - "SQLitePCLRaw.batteries_v2.dll"
 targetAbi: "10.11.8.0"
 framework: "net9.0"
-changelog: "Initial experimental beta."
+changelog: "Fixes dashboard pairing, keeps Jellyfin running on BingeCat time-outs, skips playback-progress ticks, drops queued events on re-pair and disconnect, and adds a Jellyfin 12 build."

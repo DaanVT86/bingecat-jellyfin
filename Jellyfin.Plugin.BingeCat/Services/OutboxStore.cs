@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Jellyfin.Plugin.BingeCat.Api;
 using Microsoft.Data.Sqlite;
@@ -9,6 +10,7 @@ public sealed class OutboxStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _connectionString;
+    private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _userGates = new();
 
     public OutboxStore()
     {
@@ -78,6 +80,28 @@ public sealed class OutboxStore
         update.Parameters.AddWithValue("$event_id", historyEvent.EventId);
         await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Serialises enqueue, delivery and re-pairing for one Jellyfin user so events never cross
+    /// from one BingeCat pairing to the next.
+    /// </summary>
+    public SemaphoreSlim UserGate(Guid userId)
+    {
+        return _userGates.GetOrAdd(userId, _ => new SemaphoreSlim(1, 1));
+    }
+
+    /// <summary>Drops every pending and dead-lettered event of one Jellyfin user (disconnect, re-pair).</summary>
+    public async Task ClearUserAsync(Guid userId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            DELETE FROM event_outbox WHERE user_id = $user_id;
+            DELETE FROM event_dead_letter WHERE user_id = $user_id;
+            """;
+        command.Parameters.AddWithValue("$user_id", userId.ToString("D"));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<OutboxEntry>> ReadBatchAsync(Guid userId, int limit, CancellationToken cancellationToken)

@@ -69,14 +69,21 @@ public sealed class BingeCatClient
         return await ReadAsync<EventBatchResponse>(response, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<string> StartSnapshotAsync(ProfileLink link, long generation, CancellationToken cancellationToken)
+    /// <summary>Returns null while BingeCat is still applying the previous snapshot (409 snapshot_processing).</summary>
+    public async Task<string?> StartSnapshotAsync(ProfileLink link, long generation, CancellationToken cancellationToken)
     {
         using var response = await Authorized(link).PostAsJsonAsync(Url("snapshots"), new { generation }, JsonOptions, cancellationToken).ConfigureAwait(false);
+        if (await IsSnapshotProcessingAsync(response, cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
         response.EnsureSuccessStatusCode();
         return (await ReadAsync<SnapshotStartResponse>(response, cancellationToken).ConfigureAwait(false)).RunId;
     }
 
-    public async Task ReportSnapshotFailureAsync(
+    /// <summary>Returns false while BingeCat is still applying the previous snapshot (409 snapshot_processing).</summary>
+    public async Task<bool> ReportSnapshotFailureAsync(
         ProfileLink link,
         long generation,
         string errorCode,
@@ -88,7 +95,13 @@ public sealed class BingeCatClient
             new { generation, error_code = errorCode, message },
             JsonOptions,
             cancellationToken).ConfigureAwait(false);
+        if (await IsSnapshotProcessingAsync(response, cancellationToken).ConfigureAwait(false))
+        {
+            return false;
+        }
+
         response.EnsureSuccessStatusCode();
+        return true;
     }
 
     public async Task<string> SendSnapshotPageAsync(ProfileLink link, string runId, int pageNo, IReadOnlyList<RemoteHistoryItem> items, CancellationToken cancellationToken)
@@ -143,6 +156,12 @@ public sealed class BingeCatClient
     {
         return await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken).ConfigureAwait(false)
             ?? throw new HttpRequestException("BingeCat returned an empty response.");
+    }
+
+    private async Task<bool> IsSnapshotProcessingAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        return response.StatusCode == HttpStatusCode.Conflict
+            && await TryReadErrorAsync(response, cancellationToken).ConfigureAwait(false) == "snapshot_processing";
     }
 
     private async Task<string> TryReadErrorAsync(HttpResponseMessage response, CancellationToken cancellationToken)

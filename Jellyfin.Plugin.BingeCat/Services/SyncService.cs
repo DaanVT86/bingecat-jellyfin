@@ -19,6 +19,7 @@ public sealed class SyncService : BackgroundService
     private readonly BingeCatClient _client;
     private readonly OutboxStore _outbox;
     private readonly RemoteItemFactory _itemFactory;
+    private readonly PairingService _pairing;
     private readonly ILogger<SyncService> _logger;
 
     public SyncService(
@@ -28,6 +29,7 @@ public sealed class SyncService : BackgroundService
         BingeCatClient client,
         OutboxStore outbox,
         RemoteItemFactory itemFactory,
+        PairingService pairing,
         ILogger<SyncService> logger)
     {
         _userDataManager = userDataManager;
@@ -36,6 +38,7 @@ public sealed class SyncService : BackgroundService
         _client = client;
         _outbox = outbox;
         _itemFactory = itemFactory;
+        _pairing = pairing;
         _logger = logger;
     }
 
@@ -57,7 +60,16 @@ public sealed class SyncService : BackgroundService
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
         while (!stoppingToken.IsCancellationRequested)
         {
-            await RunOnceAsync(stoppingToken).ConfigureAwait(false);
+            try
+            {
+                await RunOnceAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (!stoppingToken.IsCancellationRequested)
+            {
+                // An escaping exception would stop the whole Jellyfin host (BackgroundServiceExceptionBehavior.StopHost).
+                _logger.LogWarning(exception, "BingeCat sync pass failed");
+            }
+
             await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false);
         }
     }
@@ -66,9 +78,14 @@ public sealed class SyncService : BackgroundService
     {
         try
         {
+            // Progress ticks fire every few seconds during playback; start/stop/played/rating changes carry the state.
+            if (eventArgs.SaveReason == UserDataSaveReason.PlaybackProgress)
+            {
+                return;
+            }
+
             var configuration = Plugin.Instance?.Configuration;
-            var link = configuration?.FindLink(eventArgs.UserId);
-            if (configuration is null || !configuration.ServiceEnabled || link is null || eventArgs.Item.IsThemeMedia)
+            if (configuration is null || !configuration.ServiceEnabled || eventArgs.Item.IsThemeMedia)
             {
                 return;
             }
@@ -79,12 +96,26 @@ public sealed class SyncService : BackgroundService
                 return;
             }
 
-            await _outbox.EnqueueAsync(eventArgs.UserId, new HistoryEvent
+            var gate = _outbox.UserGate(eventArgs.UserId);
+            await gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
             {
-                EventType = "history.updated",
-                OccurredAt = DateTime.UtcNow,
-                Item = item
-            }, CancellationToken.None).ConfigureAwait(false);
+                if (configuration.FindLink(eventArgs.UserId) is null)
+                {
+                    return;
+                }
+
+                await _outbox.EnqueueAsync(eventArgs.UserId, new HistoryEvent
+                {
+                    EventType = "history.updated",
+                    OccurredAt = DateTime.UtcNow,
+                    Item = item
+                }, CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                gate.Release();
+            }
         }
         catch (Exception exception)
         {
@@ -92,7 +123,7 @@ public sealed class SyncService : BackgroundService
         }
     }
 
-    private async Task RunOnceAsync(CancellationToken cancellationToken)
+    private async Task RunOnceAsync(CancellationToken stoppingToken)
     {
         var configuration = Plugin.Instance?.Configuration;
         if (configuration is null || !configuration.ServiceEnabled)
@@ -110,34 +141,49 @@ public sealed class SyncService : BackgroundService
         }
         foreach (var link in links)
         {
-            if (!Guid.TryParse(link.JellyfinUserId, out var userId))
+            if (!Guid.TryParse(link.JellyfinUserId, out var userId) || _pairing.IsPairing(userId))
             {
                 continue;
             }
 
             try
             {
-                await DrainOutboxAsync(userId, link, cancellationToken).ConfigureAwait(false);
-                var heartbeat = await _client.HeartbeatAsync(link, cancellationToken).ConfigureAwait(false);
+                await DrainOutboxAsync(userId, link, stoppingToken).ConfigureAwait(false);
+                var heartbeat = await _client.HeartbeatAsync(link, stoppingToken).ConfigureAwait(false);
                 link.LastHeartbeatAtUtc = DateTime.UtcNow;
                 if (link.LastErrorCode != "snapshot_too_large")
                 {
                     link.LastErrorCode = string.Empty;
                 }
+
+                // Snapshot completion is asynchronous (202): BingeCat acknowledges the generation once
+                // the upload is applied. A failure acknowledges it too, with the connection in "error".
+                if (heartbeat.Connection is { } connection
+                    && connection.AcknowledgedSyncGeneration > link.AcknowledgedSyncGeneration)
+                {
+                    link.AcknowledgedSyncGeneration = connection.AcknowledgedSyncGeneration;
+                    if (connection.Status != "error")
+                    {
+                        link.LastSyncAtUtc = DateTime.UtcNow;
+                        link.LastErrorCode = string.Empty;
+                    }
+                }
+
                 if (heartbeat.SyncCommand is { Type: "full_snapshot" } command)
                 {
-                    await PublishSnapshotAsync(userId, link, command, cancellationToken).ConfigureAwait(false);
+                    await PublishSnapshotAsync(userId, link, command, stoppingToken).ConfigureAwait(false);
                 }
 
                 SaveLinkState(link);
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
+            catch (Exception exception) when (!stoppingToken.IsCancellationRequested)
             {
+                // HttpClient time-outs are OperationCanceledExceptions too: transient, not a shutdown.
                 if (link.LastErrorCode != "snapshot_too_large")
                 {
                     link.LastErrorCode = exception is HttpRequestException http
                         ? $"http_{(int?)http.StatusCode ?? 0}"
-                        : "sync_failed";
+                        : exception is OperationCanceledException ? "timeout" : "sync_failed";
                 }
                 SaveLinkState(link);
                 _logger.LogWarning(exception, "BingeCat sync failed for Jellyfin user {UserId}", userId);
@@ -145,24 +191,41 @@ public sealed class SyncService : BackgroundService
         }
     }
 
-    private async Task DrainOutboxAsync(Guid userId, ProfileLink link, CancellationToken cancellationToken)
+    private async Task DrainOutboxAsync(Guid userId, ProfileLink link, CancellationToken stoppingToken)
     {
-        var batch = await _outbox.ReadBatchAsync(userId, 100, cancellationToken).ConfigureAwait(false);
-        if (batch.Count == 0)
-        {
-            return;
-        }
-
+        var gate = _outbox.UserGate(userId);
+        await gate.WaitAsync(stoppingToken).ConfigureAwait(false);
         try
         {
-            var response = await _client.SendEventsAsync(link, batch.Select(entry => entry.Event).ToArray(), cancellationToken).ConfigureAwait(false);
-            await _outbox.DeleteAsync(response.Accepted.Concat(response.Duplicates), cancellationToken).ConfigureAwait(false);
-            await _outbox.DeadLetterAsync(userId, response.Rejected, batch, cancellationToken).ConfigureAwait(false);
+            // The link copy may predate a re-pair or disconnect: never send this user's events
+            // with a token that is no longer the current one.
+            var current = Plugin.Instance?.Configuration.FindLink(userId);
+            if (current is null || !string.Equals(current.DeviceToken, link.DeviceToken, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            var batch = await _outbox.ReadBatchAsync(userId, 100, stoppingToken).ConfigureAwait(false);
+            if (batch.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                var response = await _client.SendEventsAsync(link, batch.Select(entry => entry.Event).ToArray(), stoppingToken).ConfigureAwait(false);
+                await _outbox.DeleteAsync(response.Accepted.Concat(response.Duplicates), stoppingToken).ConfigureAwait(false);
+                await _outbox.DeadLetterAsync(userId, response.Rejected, batch, stoppingToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (!stoppingToken.IsCancellationRequested)
+            {
+                await _outbox.DeferAsync(batch, exception.Message, stoppingToken).ConfigureAwait(false);
+                throw;
+            }
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        finally
         {
-            await _outbox.DeferAsync(batch, exception.Message, cancellationToken).ConfigureAwait(false);
-            throw;
+            gate.Release();
         }
     }
 
@@ -170,7 +233,7 @@ public sealed class SyncService : BackgroundService
         Guid userId,
         ProfileLink link,
         SyncCommand command,
-        CancellationToken cancellationToken)
+        CancellationToken stoppingToken)
     {
         var user = _userManager.GetUserById(userId)
             ?? throw new InvalidOperationException("The paired Jellyfin user no longer exists.");
@@ -181,7 +244,29 @@ public sealed class SyncService : BackgroundService
             Recursive = true,
             IsVirtualItem = false
         };
+        // Count before materialising so an oversized library is rejected without loading it.
+        // ponytail: counts all movies/episodes, including ones the factory later skips, so a
+        // library just over the limit with unaddressable episodes is rejected conservatively.
+        var maxItems = Math.Max(1, command.MaxItems);
+        var libraryCount = _libraryManager.GetCount(query);
+        if (libraryCount > maxItems)
+        {
+            // false = BingeCat is still applying the previous snapshot: busy, retry next tick.
+            if (await _client.ReportSnapshotFailureAsync(
+                link,
+                command.Generation,
+                "snapshot_too_large",
+                $"The Jellyfin library contains {libraryCount} movies and episodes; limit is {maxItems}.",
+                stoppingToken).ConfigureAwait(false))
+            {
+                link.LastErrorCode = "snapshot_too_large";
+            }
+
+            return;
+        }
+
         var items = _libraryManager.GetItemList(query)
+            .OrderBy(item => item.Id)
             .Select(item => (_item: item, _userData: _userDataManager.GetUserData(user, item)))
             .Where(value => value._userData is not null)
             .Select(value => _itemFactory.Create(value._item, value._userData!))
@@ -189,33 +274,24 @@ public sealed class SyncService : BackgroundService
             .Cast<RemoteHistoryItem>()
             .ToArray();
 
-        var maxItems = Math.Max(1, command.MaxItems);
-        if (items.Length > maxItems)
+        var runId = await _client.StartSnapshotAsync(link, command.Generation, stoppingToken).ConfigureAwait(false);
+        if (runId is null)
         {
-            await _client.ReportSnapshotFailureAsync(
-                link,
-                command.Generation,
-                "snapshot_too_large",
-                $"The Jellyfin library contains {items.Length} supported items; limit is {maxItems}.",
-                cancellationToken).ConfigureAwait(false);
-            link.LastErrorCode = "snapshot_too_large";
-            return;
+            return; // Previous snapshot still being applied; the next heartbeat decides again.
         }
 
-        var runId = await _client.StartSnapshotAsync(link, command.Generation, cancellationToken).ConfigureAwait(false);
         var pageSize = Math.Clamp(command.PageSize, 25, 1_000);
         var pageCount = 0;
         var rollingChecksum = string.Empty;
         for (var offset = 0; offset < items.Length; offset += pageSize)
         {
             var page = items.Skip(offset).Take(pageSize).ToArray();
-            rollingChecksum = await _client.SendSnapshotPageAsync(link, runId, pageCount, page, cancellationToken).ConfigureAwait(false);
+            rollingChecksum = await _client.SendSnapshotPageAsync(link, runId, pageCount, page, stoppingToken).ConfigureAwait(false);
             pageCount++;
         }
 
-        await _client.CompleteSnapshotAsync(link, runId, pageCount, items.Length, rollingChecksum, cancellationToken).ConfigureAwait(false);
-        link.LastSyncAtUtc = DateTime.UtcNow;
-        link.LastErrorCode = string.Empty;
+        // 202: queued for projection. LastSyncAtUtc is set once a heartbeat shows the generation acknowledged.
+        await _client.CompleteSnapshotAsync(link, runId, pageCount, items.Length, rollingChecksum, stoppingToken).ConfigureAwait(false);
     }
 
     private static void SaveLinkState(ProfileLink snapshot)
@@ -240,6 +316,7 @@ public sealed class SyncService : BackgroundService
             current.LastHeartbeatAtUtc = snapshot.LastHeartbeatAtUtc;
             current.LastSyncAtUtc = snapshot.LastSyncAtUtc;
             current.LastErrorCode = snapshot.LastErrorCode;
+            current.AcknowledgedSyncGeneration = snapshot.AcknowledgedSyncGeneration;
             plugin.SaveConfiguration();
         }
     }

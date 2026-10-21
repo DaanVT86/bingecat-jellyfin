@@ -54,6 +54,9 @@ public sealed class ProfileLink
 
     public string LastErrorCode { get; set; } = string.Empty;
 
+    /// <summary>Last snapshot generation BingeCat reported as applied or failed.</summary>
+    public long AcknowledgedSyncGeneration { get; set; }
+
     public ProfileLink Copy()
     {
         return new ProfileLink
@@ -65,7 +68,8 @@ public sealed class ProfileLink
             LinkedAtUtc = LinkedAtUtc,
             LastHeartbeatAtUtc = LastHeartbeatAtUtc,
             LastSyncAtUtc = LastSyncAtUtc,
-            LastErrorCode = LastErrorCode
+            LastErrorCode = LastErrorCode,
+            AcknowledgedSyncGeneration = AcknowledgedSyncGeneration
         };
     }
 }

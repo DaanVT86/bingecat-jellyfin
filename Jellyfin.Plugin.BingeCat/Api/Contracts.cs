@@ -75,8 +75,20 @@ public sealed class DeviceTokenResponse
 
 public sealed class HeartbeatResponse
 {
+    [JsonPropertyName("connection")]
+    public HeartbeatConnection? Connection { get; set; }
+
     [JsonPropertyName("sync_command")]
     public SyncCommand? SyncCommand { get; set; }
+}
+
+public sealed class HeartbeatConnection
+{
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = string.Empty;
+
+    [JsonPropertyName("acknowledged_sync_generation")]
+    public long AcknowledgedSyncGeneration { get; set; }
 }
 
 public sealed class SyncCommand

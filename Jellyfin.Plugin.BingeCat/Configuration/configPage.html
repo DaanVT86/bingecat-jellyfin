@@ -9,6 +9,7 @@
     <div data-role="content">
         <div class="content-primary">
             <h1>BingeCat Sync</h1>
+            <p id="BingeCatError" role="alert" style="display:none; color:#ff6b6b"></p>
             <p>Pair each Jellyfin user with the matching BingeCat profile. All sync traffic is outbound HTTPS; your Jellyfin server stays private.</p>
             <div class="selectContainer">
                 <label class="selectLabel" for="BingeCatUser">Jellyfin user</label>
@@ -36,14 +37,32 @@
             const endpoint = (path) => ApiClient.getUrl('Plugins/BingeCat/' + path);
             let pollTimer = null;
 
+            // jellyfin-apiclient reads the method from `type` and the body from `data`, and
+            // rejects with the Response on status >= 400.
             async function json(path, method, body) {
-                const response = await ApiClient.fetch({
-                    url: endpoint(path), method: method || 'GET',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: body ? JSON.stringify(body) : undefined
-                });
-                if (!response.ok) throw new Error('Request failed (' + response.status + ')');
+                const request = { type: method || 'GET', url: endpoint(path) };
+                if (body) {
+                    request.data = JSON.stringify(body);
+                    request.contentType = 'application/json';
+                }
+                let response;
+                try {
+                    response = await ApiClient.fetch(request);
+                } catch (failure) {
+                    throw new Error('Request failed (' + ((failure && failure.status) || 'network error') + ')');
+                }
                 return response.status === 204 ? null : response.json();
+            }
+
+            function showError(error) {
+                const box = root.querySelector('#BingeCatError');
+                box.textContent = error ? String(error.message || error) : '';
+                box.style.display = error ? 'block' : 'none';
+            }
+
+            function stopPolling() {
+                clearInterval(pollTimer);
+                pollTimer = null;
             }
 
             async function refresh() {
@@ -80,8 +99,11 @@
                         button.dataset.user = String(link.userId);
                         button.textContent = 'Disconnect';
                         button.addEventListener('click', async () => {
-                            await json('Disconnect', 'POST', { userId: button.dataset.user });
-                            await refresh();
+                            showError(null);
+                            try {
+                                await json('Disconnect', 'POST', { userId: button.dataset.user });
+                                await refresh();
+                            } catch (error) { showError(error); }
                         });
                         row.append(summary, button);
                         links.append(row);
@@ -90,12 +112,16 @@
             }
 
             root.addEventListener('pageshow', async function () {
+                showError(null);
                 Dashboard.showLoadingMsg();
-                try { await refresh(); } finally { Dashboard.hideLoadingMsg(); }
+                try { await refresh(); } catch (error) { showError(error); } finally { Dashboard.hideLoadingMsg(); }
             });
+
+            root.addEventListener('pagehide', stopPolling);
 
             root.querySelector('#BingeCatPair').addEventListener('click', async function () {
                 const userId = root.querySelector('#BingeCatUser').value;
+                showError(null);
                 Dashboard.showLoadingMsg();
                 try {
                     const code = await json('ConnectStart', 'POST', { userId: userId });
@@ -103,23 +129,36 @@
                     const verify = root.querySelector('#BingeCatVerify');
                     verify.href = code.verification_uri_complete;
                     root.querySelector('#BingeCatPairing').style.display = 'block';
-                    clearInterval(pollTimer);
+                    stopPolling();
                     pollTimer = setInterval(async function () {
-                        const state = await json('Poll', 'POST', { userId: userId });
+                        let state;
+                        try {
+                            state = await json('Poll', 'POST', { userId: userId });
+                        } catch (error) {
+                            stopPolling();
+                            showError(error);
+                            return;
+                        }
                         root.querySelector('#BingeCatPairStatus').textContent = state.status === 'authorization_pending' ? 'Waiting for approval…' : state.status;
-                        if (state.status === 'connected' || state.status === 'device_code_expired') {
-                            clearInterval(pollTimer);
+                        if (state.status !== 'authorization_pending' && state.status !== 'slow_down') {
+                            stopPolling();
                             if (state.status === 'connected') {
                                 root.querySelector('#BingeCatPairing').style.display = 'none';
-                                await refresh();
+                                try { await refresh(); } catch (error) { showError(error); }
                             }
                         }
                     }, Math.max(5, code.interval || 5) * 1000);
-                } finally { Dashboard.hideLoadingMsg(); }
+                } catch (error) { showError(error); } finally { Dashboard.hideLoadingMsg(); }
             });
 
             root.querySelector('#BingeCatEnabled').addEventListener('change', async function (event) {
-                await json('Settings', 'POST', { serviceEnabled: event.target.checked });
+                showError(null);
+                try {
+                    await json('Settings', 'POST', { serviceEnabled: event.target.checked });
+                } catch (error) {
+                    event.target.checked = !event.target.checked;
+                    showError(error);
+                }
             });
         }());
     </script>
